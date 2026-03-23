@@ -1,204 +1,138 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import "dotenv/config";
 import express, { Request, Response } from "express";
 import { z } from "zod";
 import chalk from "chalk";
-import { hello, echo } from "./tools.js";
+import axios from "axios";
+import * as cheerio from "cheerio";
 
 // ============================================================================
-// Dev Logging Utilities
+// 1. Core Logic: Tailwind & Figma Utilities
 // ============================================================================
 
-const isDev = process.env.NODE_ENV !== "production";
+const getTailwindClass = (pixelValue: string, prefix: string, breakpoint?: string): string => {
+  const pixels = parseInt(pixelValue.replace("px", ""));
+  if (isNaN(pixels)) return "unknown";
 
-function timestamp(): string {
-  return new Date().toLocaleTimeString("en-US", { hour12: false });
-}
+  const tailwindValue = pixels / 4;
+  const standardScale = [
+    0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8, 9, 10, 
+    11, 12, 14, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 72, 80, 96
+  ];
 
-function formatLatency(ms: number): string {
-  if (ms < 100) return chalk.green(`${ms}ms`);
-  if (ms < 500) return chalk.yellow(`${ms}ms`);
-  return chalk.red(`${ms}ms`);
-}
+  let baseClass = standardScale.includes(tailwindValue) 
+    ? `${prefix}-${tailwindValue}` 
+    : `${prefix}-[${pixels}px]`;
 
-function truncate(str: string, maxLen = 60): string {
-  if (str.length <= maxLen) return str;
-  return str.slice(0, maxLen - 3) + "...";
-}
+  return breakpoint ? `${breakpoint}:${baseClass}` : baseClass;
+};
 
-function logRequest(method: string, params?: unknown): void {
-  if (!isDev) return;
-
-  const paramsStr = params ? chalk.gray(` ${truncate(JSON.stringify(params))}`) : "";
-  console.log(`${chalk.gray(`[${timestamp()}]`)} ${chalk.cyan("→")} ${method}${paramsStr}`);
-}
-
-function logResponse(method: string, result: unknown, latencyMs: number): void {
-  if (!isDev) return;
-
-  const latency = formatLatency(latencyMs);
-
-  // For tool calls, show the result
-  if (method === "tools/call" && result) {
-    const resultStr = typeof result === "string" ? result : JSON.stringify(result);
-    console.log(
-      `${chalk.gray(`[${timestamp()}]`)} ${chalk.green("←")} ${truncate(resultStr)} ${chalk.gray(`(${latency})`)}`
-    );
-  } else {
-    console.log(`${chalk.gray(`[${timestamp()}]`)} ${chalk.green("✓")} ${method} ${chalk.gray(`(${latency})`)}`);
-  }
-}
-
-function logError(method: string, error: unknown, latencyMs: number): void {
-  const latency = formatLatency(latencyMs);
-
-  let errorMsg: string;
-  if (error instanceof Error) {
-    errorMsg = error.message;
-  } else if (typeof error === "object" && error !== null) {
-    // JSON-RPC error object has { code, message, data? }
-    const rpcError = error as { message?: string; code?: number };
-    errorMsg = rpcError.message || `Error ${rpcError.code || "unknown"}`;
-  } else {
-    errorMsg = String(error);
-  }
-
-  console.log(
-    `${chalk.gray(`[${timestamp()}]`)} ${chalk.red("✖")} ${method} ${chalk.red(truncate(errorMsg))} ${chalk.gray(`(${latency})`)}`
-  );
-}
+const parseFigmaUrl = (url: string) => {
+  const fileKeyMatch = url.match(/\/design\/([a-zA-Z0-9]+)/) || url.match(/\/file\/([a-zA-Z0-9]+)/);
+  const nodeIdMatch = url.match(/node-id=([a-zA-Z0-9%:-]+)/);
+  
+  return {
+    fileKey: fileKeyMatch ? fileKeyMatch[1] : null,
+    nodeId: nodeIdMatch ? decodeURIComponent(nodeIdMatch[1]) : null,
+  };
+};
 
 // ============================================================================
-// MCP Server Setup
+// 2. MCP Server Configuration
 // ============================================================================
 
 const server = new McpServer({
   name: "universal-ui-auditor",
-  version: "1.0.0",
+  version: "2.1.0",
 });
 
-// Register a simple "hello" tool
-server.registerTool(
-  "hello",
-  {
-    title: "Hello Tool",
-    description: "Returns a greeting message",
-    inputSchema: {
-      name: z.string().describe("Name to greet"),
-    },
-    outputSchema: {
-      message: z.string(),
-    },
-  },
-  async ({ name }) => {
-    const output = hello(name);
-    return {
-      content: [{ type: "text", text: JSON.stringify(output) }],
-      structuredContent: output,
-    };
-  }
-);
+const FIGMA_API_URL = "https://api.figma.com/v1";
 
-// Register an "echo" tool for testing
+// ----------------------------------------------------------------------------
+// Tool: Professional UI Audit (Token-on-Demand)
+// ----------------------------------------------------------------------------
 server.registerTool(
-  "echo",
+  "audit_ui_consistency",
   {
-    title: "Echo Tool",
-    description: "Echoes back the input text",
+    title: "Universal UI Audit",
+    description: "Compare live site styles against Figma using your own Figma Access Token",
     inputSchema: {
-      text: z.string().describe("Text to echo"),
-    },
-    outputSchema: {
-      echo: z.string(),
-      timestamp: z.string(),
+      liveUrl: z.string().url().describe("The URL of the live site to audit"),
+      selector: z.string().describe("CSS Selector of the element (e.g., '.primary-button')"),
+      figmaUrl: z.string().url().describe("The Figma link to the design element"),
+      figmaToken: z.string().describe("Your Personal Figma Access Token (Generate in Figma Settings)"),
+      breakpoint: z.enum(["sm", "md", "lg", "xl", "2xl"]).optional().describe("Tailwind breakpoint prefix"),
     },
   },
-  async ({ text }) => {
-    const output = echo(text);
-    return {
-      content: [{ type: "text", text: JSON.stringify(output) }],
-      structuredContent: output,
-    };
+  async ({ liveUrl, selector, figmaUrl, figmaToken, breakpoint }) => {
+    const { fileKey, nodeId } = parseFigmaUrl(figmaUrl);
+    if (!fileKey || !nodeId) return { content: [{ type: "text", text: "Error: Invalid Figma URL format." }] };
+
+    try {
+      console.log(chalk.blue(`[Audit] Fetching Figma node using provided token...`));
+      
+      // 1. Fetch Design Specs from Figma using the user's provided token
+      const figmaRes = await axios.get(`${FIGMA_API_URL}/files/${fileKey}/nodes?ids=${nodeId}`, {
+        headers: { "X-Figma-Token": figmaToken }
+      });
+      
+      const node = figmaRes.data.nodes[nodeId].node;
+      const figmaPadding = `${node.paddingTop || 0}px`;
+      const expectedClass = getTailwindClass(figmaPadding, "p", breakpoint);
+
+      // 2. Fetch Live Site HTML
+      console.log(chalk.blue(`[Audit] Scraping live site: ${liveUrl}`));
+      const { data: html } = await axios.get(liveUrl, { timeout: 8000 });
+      const $ = cheerio.load(html);
+      const element = $(selector);
+
+      if (!element.length) return { content: [{ type: "text", text: `Error: Element "${selector}" not found.` }] };
+
+      const classes = element.attr("class") || "";
+      const isMatch = classes.includes(expectedClass);
+
+      // 3. Generate Report
+      const statusIcon = isMatch ? "✅" : "❌";
+      return {
+        content: [{ 
+          type: "text", 
+          text: `### ${statusIcon} UI Consistency Audit\n` +
+                `- **Selector:** \`${selector}\`\n` +
+                `- **Figma Spec:** ${figmaPadding}\n` +
+                `- **Required Tailwind Class:** \`${expectedClass}\`\n` +
+                `- **Current Live Classes:** \`${classes}\`\n` +
+                `- **Verdict:** ${isMatch ? "Perfect Match!" : `Update required to \`${expectedClass}\`.`}`
+        }],
+        structuredContent: { isMatch, expectedClass, actualClasses: classes },
+      };
+    } catch (error: any) {
+      const errorMessage = error.response?.status === 403 
+        ? "Invalid Figma Token provided." 
+        : error.message;
+      console.error(chalk.red(`[Error] ${errorMessage}`));
+      return { content: [{ type: "text", text: `Audit Failed: ${errorMessage}` }] };
+    }
   }
 );
 
 // ============================================================================
-// Express App Setup
+// 3. Express Server Setup
 // ============================================================================
 
 const app = express();
 app.use(express.json());
 
-// Health check endpoint (required for Cloud Run)
-app.get("/health", (_req: Request, res: Response) => {
-  res.status(200).json({ status: "healthy" });
-});
+app.get("/health", (_req, res) => res.json({ status: "healthy" }));
 
-// MCP endpoint with dev logging
 app.post("/mcp", async (req: Request, res: Response) => {
-  const startTime = Date.now();
-  const body = req.body;
-
-  // Extract method and params from JSON-RPC request
-  const method = body?.method || "unknown";
-  const params = body?.params;
-
-  // Log incoming request
-  if (method === "tools/call") {
-    const toolName = params?.name || "unknown";
-    const toolArgs = params?.arguments;
-    logRequest(`tools/call ${chalk.bold(toolName)}`, toolArgs);
-  } else if (method !== "notifications/initialized") {
-    logRequest(method, params);
-  }
-
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
   });
 
-  // Capture response body for logging
-  let responseBody = "";
-  const originalWrite = res.write.bind(res) as typeof res.write;
-  const originalEnd = res.end.bind(res) as typeof res.end;
-
-  res.write = function (chunk: unknown, encodingOrCallback?: BufferEncoding | ((error: Error | null | undefined) => void), callback?: (error: Error | null | undefined) => void) {
-    if (chunk) {
-      responseBody += typeof chunk === "string" ? chunk : Buffer.from(chunk as ArrayBuffer).toString();
-    }
-    return originalWrite(chunk as string, encodingOrCallback as BufferEncoding, callback);
-  };
-
-  res.end = function (chunk?: unknown, encodingOrCallback?: BufferEncoding | (() => void), callback?: () => void) {
-    if (chunk) {
-      responseBody += typeof chunk === "string" ? chunk : Buffer.from(chunk as ArrayBuffer).toString();
-    }
-
-    // Log response
-    if (method !== "notifications/initialized") {
-      const latency = Date.now() - startTime;
-
-      try {
-        const rpcResponse = JSON.parse(responseBody) as { result?: unknown; error?: unknown };
-
-        if (rpcResponse?.error) {
-          logError(method, rpcResponse.error, latency);
-        } else if (method === "tools/call") {
-          const content = (rpcResponse?.result as { content?: Array<{ text?: string }> })?.content;
-          const resultText = content?.[0]?.text;
-          logResponse(method, resultText, latency);
-        } else {
-          logResponse(method, null, latency);
-        }
-      } catch {
-        logResponse(method, null, latency);
-      }
-    }
-
-    return originalEnd(chunk as string, encodingOrCallback as BufferEncoding, callback);
-  };
-
   res.on("close", () => {
+    console.log(chalk.gray("[System] Transport Disconnected"));
     transport.close();
   });
 
@@ -206,33 +140,9 @@ app.post("/mcp", async (req: Request, res: Response) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-// JSON error handler (Express defaults to HTML errors)
-app.use((_err: unknown, _req: Request, res: Response, _next: Function) => {
-  res.status(500).json({ error: "Internal server error" });
-});
-
-// ============================================================================
-// Start Server
-// ============================================================================
-
-const port = parseInt(process.env.PORT || "8080");
-const httpServer = app.listen(port, () => {
-  console.log();
-  console.log(chalk.bold("MCP Server running on"), chalk.cyan(`http://localhost:${port}`));
-  console.log(`  ${chalk.gray("Health:")} http://localhost:${port}/health`);
-  console.log(`  ${chalk.gray("MCP:")}    http://localhost:${port}/mcp`);
-
-  if (isDev) {
-    console.log();
-    console.log(chalk.gray("─".repeat(50)));
-    console.log();
-  }
-});
-
-// Graceful shutdown for Cloud Run (SIGTERM before kill)
-process.on("SIGTERM", () => {
-  console.log("Received SIGTERM, shutting down...");
-  httpServer.close(() => {
-    process.exit(0);
-  });
+const port = process.env.PORT || 8080;
+app.listen(port, () => {
+  console.log(chalk.bold.green("\n🚀 Universal UI Auditor MCP v2.1.0"));
+  console.log(chalk.cyan(`   Listening on: http://localhost:${port}/mcp`));
+  console.log(chalk.yellow(`   Note: This server requires users to provide their own Figma Token.\n`));
 });
